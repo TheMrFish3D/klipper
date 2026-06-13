@@ -115,6 +115,10 @@ class GCodeDispatch:
         self.mux_commands = {}
         self.gcode_help = {}
         self.status_commands = {}
+        # State for allowing CANCEL_PRINT to interrupt heater wait commands.
+        self.cancel_print_requested = False
+        self.cancel_print_command_depth = 0
+        self.cancelled_wait = False
         # Register commands needed before config file is loaded
         handlers = ['M110', 'M112', 'M115',
                     'RESTART', 'FIRMWARE_RESTART', 'ECHO', 'STATUS', 'HELP']
@@ -183,7 +187,11 @@ class GCodeDispatch:
         self.status_commands = commands
     def register_output_handler(self, cb):
         self.output_callbacks.append(cb)
+    def _clear_pending_cancel_print(self):
+        self.cancel_print_requested = False
+        self.cancelled_wait = False
     def _handle_shutdown(self):
+        self._clear_pending_cancel_print()
         if not self.is_printer_ready:
             return
         self.is_printer_ready = False
@@ -191,8 +199,10 @@ class GCodeDispatch:
         self._build_status_commands()
         self._respond_state("Shutdown")
     def _handle_disconnect(self):
+        self._clear_pending_cancel_print()
         self._respond_state("Disconnect")
     def _handle_ready(self):
+        self._clear_pending_cancel_print()
         self.is_printer_ready = True
         self.gcode_handlers = self.ready_gcode_handlers
         self._build_status_commands()
@@ -200,6 +210,7 @@ class GCodeDispatch:
     # Parse input into commands
     args_r = re.compile('([A-Z_]+|[A-Z*])')
     def _process_commands(self, commands, need_ack=True):
+        skip_after_cancel_print = False
         for line in commands:
             # Ignore comments and leading/trailing spaces
             line = origline = line.strip()
@@ -219,26 +230,72 @@ class GCodeDispatch:
             gcmd = GCodeCommand(self, cmd, origline, params, need_ack)
             # Invoke handler for command
             handler = self.gcode_handlers.get(cmd, self.cmd_default)
+            is_cancel_print = cmd == 'CANCEL_PRINT'
+            is_emergency_stop = cmd == 'M112'
+            cancel_wait_active = (self.cancelled_wait
+                                  and not self.cancel_print_command_depth)
+            # After a heater wait is cancelled, drain stale queued commands
+            # until the cancel handler runs. Then drain the rest of this batch.
+            # Emergency stop must remain available throughout the drain.
+            if ((skip_after_cancel_print
+                 and not is_cancel_print
+                 and not is_emergency_stop)
+                or (cancel_wait_active
+                    and not is_cancel_print
+                    and not is_emergency_stop)):
+                gcmd.ack()
+                continue
+            if is_cancel_print:
+                self.cancel_print_requested = False
+                self.cancelled_wait = False
+                self.cancel_print_command_depth += 1
             try:
-                handler(gcmd)
-            except self.error as e:
-                self._respond_error(str(e))
-                self.printer.send_event("gcode:command_error")
-                if not need_ack:
-                    raise
-            except:
-                msg = 'Internal error on command:"%s"' % (cmd,)
-                logging.exception(msg)
-                self.printer.invoke_shutdown(msg)
-                self._respond_error(msg)
-                if not need_ack:
-                    raise
+                try:
+                    handler(gcmd)
+                except self.error as e:
+                    self._respond_error(str(e))
+                    self.printer.send_event("gcode:command_error")
+                    if not need_ack:
+                        raise
+                except:
+                    msg = 'Internal error on command:"%s"' % (cmd,)
+                    logging.exception(msg)
+                    self.printer.invoke_shutdown(msg)
+                    self._respond_error(msg)
+                    if not need_ack:
+                        raise
+            finally:
+                if is_cancel_print:
+                    self.cancel_print_command_depth -= 1
+                    if not self.cancel_print_command_depth:
+                        self.cancel_print_requested = False
+                        self.cancelled_wait = False
             gcmd.ack()
+            if cancel_wait_active and is_cancel_print:
+                skip_after_cancel_print = True
     def run_script_from_command(self, script):
         self._process_commands(script.split('\n'), need_ack=False)
+    cancel_print_r = re.compile(r'^(?:[nN][0-9]+)?\s*CANCEL_PRINT(?:\s|$)',
+                                re.I)
+    def note_cancel_print(self, lines):
+        if 'CANCEL_PRINT' not in self.gcode_handlers:
+            return
+        for line in lines:
+            if self.cancel_print_r.match(line) is not None:
+                self.cancel_print_requested = True
+                return
+    def is_cancel_print_requested(self):
+        return self.cancel_print_requested
+    def note_cancelled_wait(self):
+        self.cancelled_wait = True
     def run_script(self, script):
+        # run_script() can queue behind a heater wait; pre-scan so the wait can
+        # return before the queued CANCEL_PRINT reaches the gcode mutex.
+        commands = script.split('\n')
+        if self.mutex.test():
+            self.note_cancel_print(commands)
         with self.mutex:
-            self._process_commands(script.split('\n'), need_ack=False)
+            self._process_commands(commands, need_ack=False)
     def get_mutex(self):
         return self.mutex
     def create_gcode_command(self, command, commandline, params):
@@ -453,11 +510,15 @@ class GCodeIO:
                 self.gcode.request_restart('exit')
             pending_commands.append("")
         # Handle case where multiple commands pending
+        check_cancel = self.is_processing_data or self.gcode_mutex.test()
         if len(pending_commands) < 20:
-            # Check for M112 out-of-order
+            # Check for M112 and CANCEL_PRINT out-of-order
             for line in lines:
                 if self.m112_r.match(line) is not None:
                     self.gcode.cmd_M112(None)
+                elif (check_cancel
+                      and self.gcode.cancel_print_r.match(line) is not None):
+                    self.gcode.note_cancel_print([line])
         if self.is_processing_data:
             if len(pending_commands) >= 20:
                 # Stop reading input
