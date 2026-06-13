@@ -353,9 +353,11 @@ class PrinterHeaters:
         gcode = self.printer.lookup_object("gcode")
         reactor = self.printer.get_reactor()
         eventtime = reactor.monotonic()
-        while not self.printer.is_shutdown() and heater.check_busy(eventtime):
+        while not self.printer.is_shutdown():
             if gcode.is_cancel_print_requested():
                 gcode.note_cancelled_wait()
+                return
+            if not heater.check_busy(eventtime):
                 return
             print_time = toolhead.get_last_move_time()
             gcode.respond_raw(self._get_temp(eventtime))

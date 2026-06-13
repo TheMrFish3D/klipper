@@ -224,10 +224,12 @@ class GCodeDispatch:
             # Invoke handler for command
             handler = self.gcode_handlers.get(cmd, self.cmd_default)
             is_cancel_print = cmd == 'CANCEL_PRINT'
+            is_emergency_stop = cmd == 'M112'
             cancel_wait_active = (self.cancelled_wait
                                   and not self.cancel_print_command_depth)
             if skip_after_cancel_print or (cancel_wait_active
-                                           and not is_cancel_print):
+                                           and not is_cancel_print
+                                           and not is_emergency_stop):
                 gcmd.ack()
                 continue
             if is_cancel_print:
