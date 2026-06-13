@@ -202,6 +202,7 @@ class GCodeDispatch:
         self._clear_pending_cancel_print()
         self._respond_state("Disconnect")
     def _handle_ready(self):
+        self._clear_pending_cancel_print()
         self.is_printer_ready = True
         self.gcode_handlers = self.ready_gcode_handlers
         self._build_status_commands()
@@ -236,7 +237,9 @@ class GCodeDispatch:
             # After a heater wait is cancelled, drain stale queued commands
             # until the cancel handler runs. Then drain the rest of this batch.
             # Emergency stop must remain available throughout the drain.
-            if ((skip_after_cancel_print and not is_emergency_stop)
+            if ((skip_after_cancel_print
+                 and not is_cancel_print
+                 and not is_emergency_stop)
                 or (cancel_wait_active
                     and not is_cancel_print
                     and not is_emergency_stop)):
@@ -282,17 +285,17 @@ class GCodeDispatch:
                 self.cancel_print_requested = True
                 return
     def is_cancel_print_requested(self):
-        return (self.cancel_print_requested
-                and not self.cancel_print_command_depth)
+        return self.cancel_print_requested
     def note_cancelled_wait(self):
         self.cancelled_wait = True
     def run_script(self, script):
         # run_script() can queue behind a heater wait; pre-scan so the wait can
         # return before the queued CANCEL_PRINT reaches the gcode mutex.
+        commands = script.split('\n')
         if self.mutex.test():
-            self.note_cancel_print(script.split('\n'))
+            self.note_cancel_print(commands)
         with self.mutex:
-            self._process_commands(script.split('\n'), need_ack=False)
+            self._process_commands(commands, need_ack=False)
     def get_mutex(self):
         return self.mutex
     def create_gcode_command(self, command, commandline, params):
