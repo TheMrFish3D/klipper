@@ -115,6 +115,7 @@ class GCodeDispatch:
         self.mux_commands = {}
         self.gcode_help = {}
         self.status_commands = {}
+        # State for allowing CANCEL_PRINT to interrupt heater wait commands.
         self.cancel_print_requested = False
         self.cancel_print_command_depth = 0
         self.cancelled_wait = False
@@ -186,7 +187,11 @@ class GCodeDispatch:
         self.status_commands = commands
     def register_output_handler(self, cb):
         self.output_callbacks.append(cb)
+    def _clear_pending_cancel_print(self):
+        self.cancel_print_requested = False
+        self.cancelled_wait = False
     def _handle_shutdown(self):
+        self._clear_pending_cancel_print()
         if not self.is_printer_ready:
             return
         self.is_printer_ready = False
@@ -194,6 +199,7 @@ class GCodeDispatch:
         self._build_status_commands()
         self._respond_state("Shutdown")
     def _handle_disconnect(self):
+        self._clear_pending_cancel_print()
         self._respond_state("Disconnect")
     def _handle_ready(self):
         self.is_printer_ready = True
@@ -227,6 +233,9 @@ class GCodeDispatch:
             is_emergency_stop = cmd == 'M112'
             cancel_wait_active = (self.cancelled_wait
                                   and not self.cancel_print_command_depth)
+            # After a heater wait is cancelled, drain stale queued commands
+            # until the cancel handler runs. Then drain the rest of this batch.
+            # Emergency stop must remain available throughout the drain.
             if ((skip_after_cancel_print and not is_emergency_stop)
                 or (cancel_wait_active
                     and not is_cancel_print
@@ -278,6 +287,8 @@ class GCodeDispatch:
     def note_cancelled_wait(self):
         self.cancelled_wait = True
     def run_script(self, script):
+        # run_script() can queue behind a heater wait; pre-scan so the wait can
+        # return before the queued CANCEL_PRINT reaches the gcode mutex.
         if self.mutex.test():
             self.note_cancel_print(script.split('\n'))
         with self.mutex:
